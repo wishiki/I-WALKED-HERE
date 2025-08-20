@@ -11,7 +11,9 @@ GETTING THE BADGE
 
 How did you get here? Did you walk? Oh, then you got the badge!
 
-REWARD FOR WALKING Open the Walking Tracker to record your journey to a destination of your choice and receive a minimum 10% discount on a purchase .
+REWARD FOR WALKING 
+
+Open the Walking Tracker to record your journey to a destination of your choice and receive a minimum 10% discount on a purchase .
 
 Track your return to the ArtBomb store to earn the I WALKED HERE badge!
 
