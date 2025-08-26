@@ -1,8 +1,5 @@
 # I WALKED HERE
 
-
-A photograph of sliced kiwifruit on a while plate
-
 I WALKED HERE is a compaign for Doncaster that promotes walking as the best mode of transportation. By overiding the pervasive 100% Electric, 0 Emissions tagline often seen on electric vehicles, I WALKED HERE declares "100% On Foot, 0 Footprint".
 
 Can we be as proud of walking somewhere as we are of driving there?
