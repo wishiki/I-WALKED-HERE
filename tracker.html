@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Walking Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <!-- Cooper Hewitt font (includes Heavy weight) -->
+    <link rel="stylesheet" href="stylesheet.css" type="text/css" charset="utf-8"/>
+  <style>
+    body { font-family: 'cooper_hewittheavy';  padding: 20px; padding-bottom: 80px; }
+    button { padding: 10px 16px; margin: 8px 6px 8px 0; }
+    #map { height: 320px; margin-top: 12px; }
+    .emoji-marker {
+      font-size: 24px; line-height: 24px; text-align: center;
+      transform: translate(-12px, -12px); pointer-events: none;
+    }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .controls input[type="text"]{
+      flex:1 1 260px; padding:10px 12px; border:1px solid #ddd; border-radius:10px; font-size:14px;
+    }
+    .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:#f3f4f6; font-size:12px; color:#374151; margin-top:6px;}
+    .stats { margin-top:8px; font-size:14px; color:#374151;}
+    .next { margin-top:6px; font-size:13px; color:#4b5563;}
+    .err { color:#b91c1c; }
+    /* Sticky footer */
+    footer {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      padding: 10px 14px; text-align: center;
+      background: rgba(245, 245, 245, 0.9); border-top: 1px solid #e5e5e5;
+      font-family: 'cooper_hewittheavy',system-ui,'cooper_hewittheavy';
+      font-size: 12px; color: #6b7280; backdrop-filter: blur(6px);
+    }
+    @media (prefers-color-scheme: dark) {
+      footer { background: rgba(20,20,22,0.7); border-top-color:#2a2a2a; color:#9ca3af; }
+      .pill { background:#111827; color:#e5e7eb; }
+      .controls input[type="text"]{ border-color:#2a2a2a; background:#0b0b0d; color:#e5e7eb; }
+    }
+    
+        #title{
+    font-size: 2em;
+    }
+  </style>
+</head>
+<body>
+    <div id="title">🚶‍♂️ Walking Tracker</div>
+  <p>Track your walk and navigate to a destination.</p>
+
+  <div class="controls">
+    <input id="searchInput" type="text" placeholder="Enter destination address or place…" />
+    <button id="goBtn">Go</button>
+    <button id="startBtn">Start Tracking</button>
+    <button id="stopBtn" disabled>Stop Tracking</button>
+  </div>
+
+  <div id="output" class="pill" style="display:none;"></div>
+  <div id="map"></div>
+
+  <div class="stats" id="routeStats" style="display:none;"></div>
+  <div class="next" id="nextStep" style="display:none;"></div>
+
+  <footer>
+    Built with the Leaflet library and developed with help from ChatGPT-5 and GPT-4o.
+    Your location is only used inside your browser while tracking — it isn’t saved or sent anywhere, and it disappears when you close the page.
+  </footer>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    // --- Map & layers ---
+    let map, pathLayer;
+    let userMarker = null;
+    let accuracyCircle = null;
+    let destMarker = null;
+    let routeLine = null;
+
+    // --- Tracking state ---
+    let watchId = null;
+    let positions = [];
+    let cleanPositions = [];
+
+    // --- Navigation state ---
+    let destination = null;            // {lat, lon}
+    let routeGeo = null;               // GeoJSON LineString
+    let routeSteps = [];               // simplified steps
+    let routeRemainingMeters = 0;
+    const offRouteThresholdM = 30;
+
+    // --- Filters & units ---
+    const ACC_MAX_M = 50;
+    const MIN_MOVE_M = 3;
+    const MAX_SEG_SPEED_KMH = 30;
+    const SMOOTH_ALPHA = 0.2;
+    const M_PER_MI = 1609.34;
+
+    function metersToMiles(m){ return m / M_PER_MI; }
+    function msToMph(ms){ return ms * 2.23694; }
+    function formatMiles(m){
+      const mi = metersToMiles(m);
+      return mi >= 0.5 ? mi.toFixed(2)+' mi' : Math.round(mi*1760) + ' yd';
+    }
+    function haversine(lat1, lon1, lat2, lon2){
+      const R = 6371e3, toRad=x=>x*Math.PI/180;
+      const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    // --- Wake Lock (keeps screen on; not true background) ---
+    let wakeLock = null;
+    async function requestWakeLock(){
+      try{ if('wakeLock' in navigator){ wakeLock = await navigator.wakeLock.request('screen'); } }catch(e){ console.warn('WakeLock:', e.message); }
+    }
+    function releaseWakeLock(){ try{ wakeLock?.release(); }catch{} finally{ wakeLock=null; } }
+    document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && watchId!=null){ requestWakeLock(); } });
+
+    // --- Map helpers ---
+    function ensureMap(lat, lon){
+      if(map) return;
+      map = L.map('map').setView([lat, lon], 16);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+      pathLayer = L.polyline([], { color:'blue' }).addTo(map);
+    }
+    function updateUserLocation(lat, lon, accuracy){
+      ensureMap(lat, lon);
+
+      const emojiIcon = L.divIcon({ className:'emoji-marker', html:'🚶‍♂️', iconSize:[24,24] });
+
+      if(!userMarker){
+        userMarker = L.marker([lat, lon], { icon: emojiIcon }).addTo(map).bindPopup('You are here');
+      } else {
+        userMarker.setLatLng([lat, lon]);
+      }
+
+      if(!accuracyCircle){
+        accuracyCircle = L.circle([lat, lon], { radius: accuracy||0, color:'#136AEC', fillColor:'#136AEC', fillOpacity:0.15, weight:1 }).addTo(map);
+      } else {
+        accuracyCircle.setLatLng([lat, lon]);
+        if(typeof accuracy === 'number') accuracyCircle.setRadius(accuracy);
+      }
+      map.setView([lat, lon]);
+    }
+    function updatePath(lat, lon){
+      ensureMap(lat, lon);
+      pathLayer.addLatLng([lat, lon]);
+    }
+    function setDestination(lat, lon){
+      ensureMap(lat, lon);
+      destination = {lat, lon};
+      if(destMarker){ destMarker.setLatLng([lat, lon]); }
+      else { destMarker = L.marker([lat, lon]).addTo(map).bindPopup('Destination'); }
+    }
+
+    // --- Routing (WALKING) ---
+    async function fetchRoute(from, to) {
+      ensureMap(from.lat, from.lon);
+
+      // 1) Prefer OSM.de routed-foot (strict pedestrian router)
+      const footURL1 = `https://routing.openstreetmap.de/routed-foot/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson&steps=true`;
+
+      // 2) Fallback to OSRM demo with foot profile
+      const footURL2 = `https://router.project-osrm.org/route/v1/foot/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson&steps=true`;
+
+      let data;
+      try {
+        const r = await fetch(footURL1, { headers: { 'Accept': 'application/json' }});
+        if (!r.ok) throw new Error('OSM.de foot router unavailable');
+        data = await r.json();
+        if (!data?.routes?.length) throw new Error('No walking route found (OSM.de)');
+      } catch (e) {
+        const r2 = await fetch(footURL2, { headers: { 'Accept': 'application/json' }});
+        if (!r2.ok) throw new Error('Route request failed (OSRM foot)');
+        data = await r2.json();
+        if (!data?.routes?.length) throw new Error('No walking route found (OSRM foot)');
+      }
+
+      const route = data.routes[0];
+      routeGeo = route.geometry;
+      if (!routeGeo || !routeGeo.coordinates) throw new Error('Invalid route geometry');
+
+      // draw/update polyline (green)
+      const coordsLatLng = routeGeo.coordinates.map(([x, y]) => [y, x]);
+      if (routeLine) {
+        routeLine.setLatLngs(coordsLatLng);
+      } else {
+        routeLine = L.polyline(coordsLatLng, { color:'#10b981', weight:5, opacity:0.7 }).addTo(map);
+      }
+
+      routeRemainingMeters = route.distance ?? 0;
+      routeSteps = (route.legs?.[0]?.steps || []).map(s => ({
+        distance: s.distance,
+        name: s.name || 'Continue',
+        maneuver: s.maneuver?.type || 'continue',
+        modifier: s.maneuver?.modifier || ''
+      }));
+
+      // fit bounds
+      const bounds = L.latLngBounds(coordsLatLng);
+      if (userMarker) bounds.extend(userMarker.getLatLng());
+      map.fitBounds(bounds.pad(0.15));
+
+      document.getElementById('routeStats').style.display = 'block';
+      document.getElementById('nextStep').style.display = 'block';
+      renderRouteStats(routeRemainingMeters, route.duration);
+      renderNextStep();
+    }
+
+    function renderRouteStats(distanceM, durationS){
+      const miles = metersToMiles(distanceM);
+      const mph = 3; // fallback walking speed if duration missing
+      const etaMin = durationS ? (durationS/60) : (miles / mph * 60);
+      document.getElementById('routeStats').innerHTML =
+        `<strong>Route:</strong> ${formatMiles(distanceM)} • ETA ~ ${Math.max(1, Math.round(etaMin))} min`;
+    }
+    function renderNextStep(){
+      if(!routeSteps.length){ document.getElementById('nextStep').textContent = 'Head to your destination'; return; }
+      const step = routeSteps[0];
+      const mod = step.modifier ? ` (${step.modifier})` : '';
+      document.getElementById('nextStep').textContent = `Next: ${step.name}${mod} • ${formatMiles(step.distance)}`;
+    }
+
+    // Approx distance from current point to route (fast via vertices)
+    function distancePointToLineMeters(lat, lon, lineCoords){
+      let min = Infinity;
+      for(const [x,y] of lineCoords){
+        const d = haversine(lat, lon, y, x);
+        if(d < min) min = d;
+      }
+      return min;
+    }
+
+    // --- Geocoding (Nominatim) ---
+    async function geocode(query){
+      const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`;
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' }});
+      if(!r.ok) throw new Error('Geocoding failed');
+      const data = await r.json();
+      if(!data.length) throw new Error('No results');
+      const { lat, lon, display_name } = data[0];
+      return { lat: parseFloat(lat), lon: parseFloat(lon), label: display_name };
+    }
+
+    // --- Tracking handlers ---
+    async function startTracking(){
+      positions = []; cleanPositions = [];
+      pathLayer?.setLatLngs([]);
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = false;
+
+      requestWakeLock();
+
+      if(!navigator.geolocation){
+        showMsg('Geolocation not supported', true);
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+        releaseWakeLock();
+        return;
+      }
+
+      watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+        enableHighAccuracy: true, maximumAge: 0, timeout: 15000
+      });
+      showMsg('Tracking…');
+    }
+
+    function stopTracking(){
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+      document.getElementById('stopBtn').disabled = true;
+      document.getElementById('startBtn').disabled = false;
+
+      // Show the walked/not-walking summary
+      analyzeData();
+
+      // Do NOT overwrite the summary with an extra message
+      releaseWakeLock();
+    }
+
+    function onPosition(pos){
+      const { latitude, longitude, accuracy } = pos.coords;
+      const timestamp = pos.timestamp;
+
+      updateUserLocation(latitude, longitude, accuracy);
+      positions.push({ latitude, longitude, timestamp, accuracy });
+
+      // light filters
+      if (typeof accuracy === 'number' && accuracy > ACC_MAX_M) return;
+
+      let lat = latitude, lon = longitude;
+      const last = cleanPositions[cleanPositions.length - 1];
+      if (last) {
+        lat = last.latitude + SMOOTH_ALPHA * (latitude - last.latitude);
+        lon = last.longitude + SMOOTH_ALPHA * (longitude - last.longitude);
+      }
+
+      if (last) {
+        const segDist = haversine(last.latitude, last.longitude, lat, lon);
+        const segTime = (timestamp - last.timestamp) / 1000;
+        if (segDist < MIN_MOVE_M) return;
+        if (segTime > 0) {
+          const segSpeedKmh = (segDist / segTime) * 3.6;
+          if (segSpeedKmh > MAX_SEG_SPEED_KMH) return;
+        }
+      }
+
+      cleanPositions.push({ latitude: lat, longitude: lon, timestamp, accuracy });
+      updatePath(lat, lon);
+
+      // If navigating, update remaining distance & reroute if too far off
+      if(destination && routeGeo){
+        const beeline = haversine(lat, lon, destination.lat, destination.lon);
+        const off = distancePointToLineMeters(lat, lon, routeGeo.coordinates);
+        if(off > offRouteThresholdM){
+          fetchRoute({lat, lon}, destination).catch(err => showMsg('Reroute failed', true));
+        } else {
+          renderRouteStats(beeline, null);
+        }
+      }
+    }
+
+    function onError(err){
+      showMsg('Location error: ' + err.message, true);
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      releaseWakeLock();
+    }
+
+    function analyzeData(){
+      if (cleanPositions.length < 2) { showMsg('Not enough data.'); return; }
+
+      let totalDistanceM = 0;
+      let totalTimeS = (cleanPositions[cleanPositions.length - 1].timestamp - cleanPositions[0].timestamp) / 1000;
+
+      for (let i = 1; i < cleanPositions.length; i++) {
+        totalDistanceM += haversine(
+          cleanPositions[i - 1].latitude, cleanPositions[i - 1].longitude,
+          cleanPositions[i].latitude, cleanPositions[i].longitude
+        );
+      }
+
+      const avgSpeedMph = msToMph(totalDistanceM / totalTimeS);
+      const distanceMi = metersToMiles(totalDistanceM);
+      const walked = avgSpeedMph >= 1.2 && avgSpeedMph <= 4.3;
+
+      const html =
+        `<strong>Stopped.</strong> ` +
+        `<strong>Trip:</strong> ${distanceMi.toFixed(2)} mi • ${(totalTimeS/60).toFixed(1)} min • ${avgSpeedMph.toFixed(2)} mph<br>`+
+        `<strong>Status:</strong> ${walked ? '🚶 You walked!' : '🚗 Likely not walking'}`;
+      showMsg(html);
+    }
+
+    // --- UI helpers ---
+    function showMsg(msg, isErr=false){
+      const el = document.getElementById('output');
+      el.style.display = 'inline-block';
+      el.className = 'pill' + (isErr ? ' err' : '');
+      el.innerHTML = msg;
+    }
+
+    // --- Search / Go handlers ---
+    document.getElementById('goBtn').addEventListener('click', doGo);
+    async function doGo(){
+      const q = document.getElementById('searchInput').value.trim();
+      if(!q){ showMsg('Enter a destination to navigate'); return; }
+
+      try{
+        showMsg('Finding destination…');
+        const res = await geocode(q);
+        setDestination(res.lat, res.lon);
+        showMsg('Calculating route…');
+        // origin: prefer last clean point, else last raw, else destination (will still draw route)
+        let origin = cleanPositions.length ?
+          { lat: cleanPositions.at(-1).latitude, lon: cleanPositions.at(-1).longitude } :
+          (positions.length ? { lat: positions.at(-1).latitude, lon: positions.at(-1).longitude } :
+            { lat: res.lat, lon: res.lon });
+        await fetchRoute(origin, {lat: res.lat, lon: res.lon});
+        showMsg('Route ready');
+      }catch(e){
+        showMsg(e.message || 'Failed to find route', true);
+      }
+    }
+
+    // --- Start/Stop handlers ---
+    document.getElementById('startBtn').addEventListener('click', startTracking);
+    document.getElementById('stopBtn').addEventListener('click', stopTracking);
+  </script>
+</body>
+</html>
+
